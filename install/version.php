@@ -1,5 +1,6 @@
 <?php
-$arModuleVersion = [
-    "VERSION" => "1.1.0",
-    "VERSION_DATE" => "2025-12-09 12:00:00",
-];
+// /local/modules/solka_module/install/version.php
+$arModuleVersion = array(
+    'VERSION' => '1.0.0',
+    'VERSION_DATE' => '2024-12-08 12:00:00'
+);
