@@ -3,95 +3,124 @@ namespace Solka;
 
 use Bitrix\Main\Loader;
 
-class TestUpdater
+class UpdaterTest
 {
     const PROP_PRIMENIMOST = 161;
-    private static $doUpdate = false;
 
-    public static function process($filePath, $updateMode = false)
+    private static $mode = 'test';
+    private static $logFile = '/bitrix/logs/parts_update.log';
+
+    public static function process($filePath, $mode = 'test')
     {
-        self::$doUpdate = $updateMode;
+        self::$mode = ($mode === 'update') ? 'update' : 'test';
+
         Loader::includeModule('iblock');
 
-        $reader = array_map('str_getcsv', file($filePath));
-        $result = ['updated' => [], 'errors' => []];
+        self::log('START', [
+            'mode' => self::$mode,
+            'file' => $filePath
+        ]);
 
-        foreach ($reader as $i => $row) {
+        $rows = array_map('str_getcsv', file($filePath));
+
+        $result = [
+            'MODE' => self::$mode,
+            'AUTOS' => [],
+            'ERRORS' => []
+        ];
+
+        foreach ($rows as $i => $row) {
             if ($i === 0) continue;
 
-            $rawOld = trim($row[0]);
-            $rawNew = trim($row[2]);
+            $rawOld = trim($row[0] ?? '');
+            $rawNew = trim($row[2] ?? '');
 
             if (!$rawOld || !$rawNew) continue;
 
             if (!preg_match('/\[(\d+)\]/', $rawNew, $m)) continue;
             $autoId = (int)$m[1];
 
-            // Очищаем оба названия для сравнения
             $oldAutoName = self::cleanName($rawOld);
             $newAutoName = self::cleanName($rawNew);
 
-            // Получаем раздел автомобиля
             $section = \CIBlockSection::GetByID($autoId)->Fetch();
             if (!$section) {
-                $result['errors'][] = "Раздел с ID $autoId не найден";
+                $result['ERRORS'][] = "Раздел авто ID {$autoId} не найден";
                 continue;
             }
 
-            // Обновляем название раздела авто
+            /** --- АВТО --- */
+            $autoWillChange = ($section['NAME'] !== $newAutoName);
             $autoUpdated = false;
-            if ($section['NAME'] !== $newAutoName) {
-                if (self::$doUpdate) {
-                    $bs = new \CIBlockSection;
-                    if ($bs->Update($autoId, ['NAME' => $newAutoName])) {
-                        $autoUpdated = true;
-                    }
-                }
+
+            if ($autoWillChange && self::$mode === 'update') {
+                $bs = new \CIBlockSection;
+                $autoUpdated = $bs->Update($autoId, ['NAME' => $newAutoName]);
             }
 
-            // Ищем запчасти, привязанные к этому авто
+            if ($autoWillChange) {
+                self::log('AUTO', [
+                    'AUTO_ID' => $autoId,
+                    'OLD' => $section['NAME'],
+                    'NEW' => $newAutoName,
+                    'UPDATED' => $autoUpdated
+                ]);
+            }
+
+            /** --- ЗАПЧАСТИ --- */
             $parts = [];
+
             $rsParts = \CIBlockElement::GetList(
                 [],
                 ['PROPERTY_' . self::PROP_PRIMENIMOST => $autoId],
                 false,
                 false,
-                ['ID', 'NAME', 'IBLOCK_ID']
+                ['ID', 'NAME']
             );
 
             while ($p = $rsParts->Fetch()) {
-                // Заменяем старое название авто в названии запчасти на новое
-                $oldPartName = $p['NAME'];
-                $newPartName = self::updatePartName($oldPartName, $oldAutoName, $newAutoName);
-                
-                if ($oldPartName !== $newPartName) {
+                $newPartName = self::updatePartName(
+                    $p['NAME'],
+                    $oldAutoName,
+                    $newAutoName
+                );
+
+                if ($p['NAME'] !== $newPartName) {
                     $partUpdated = false;
-                    
-                    if (self::$doUpdate) {
+
+                    if (self::$mode === 'update') {
                         $el = new \CIBlockElement;
-                        if ($el->Update($p['ID'], ['NAME' => $newPartName])) {
-                            $partUpdated = true;
-                        }
+                        $partUpdated = $el->Update($p['ID'], ['NAME' => $newPartName]);
                     }
-                    
+
+                    self::log('PART', [
+                        'PART_ID' => $p['ID'],
+                        'OLD' => $p['NAME'],
+                        'NEW' => $newPartName,
+                        'UPDATED' => $partUpdated
+                    ]);
+
                     $parts[] = [
                         'PART_ID' => $p['ID'],
-                        'OLD_NAME' => $oldPartName,
+                        'OLD_NAME' => $p['NAME'],
                         'NEW_NAME' => $newPartName,
                         'UPDATED' => $partUpdated
                     ];
                 }
             }
 
-            $result['updated'][] = [
+            $result['AUTOS'][] = [
                 'AUTO_ID' => $autoId,
-                'SECTION_OLD' => $section['NAME'],
-                'SECTION_NEW' => $newAutoName,
+                'OLD_NAME' => $section['NAME'],
+                'NEW_NAME' => $newAutoName,
+                'AUTO_WILL_CHANGE' => $autoWillChange,
                 'AUTO_UPDATED' => $autoUpdated,
-                'PARTS_COUNT' => count($parts),
+                'PARTS_FOUND' => count($parts),
                 'PARTS' => $parts
             ];
         }
+
+        self::log('FINISH');
 
         header('Content-Type: application/json; charset=utf-8');
         echo json_encode($result, JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT);
@@ -100,34 +129,49 @@ class TestUpdater
 
     private static function cleanName($text)
     {
-        // Убираем точки и ID
         $text = preg_replace('/\.+/', '', $text);
         $text = preg_replace('/\s*\[\d+\]/', '', $text);
-
-        // Убираем лишние пробелы
         $text = preg_replace('/\s+/', ' ', $text);
         return trim($text);
     }
 
     private static function updatePartName($partName, $oldAutoName, $newAutoName)
     {
-       
-        if ($oldAutoName === $newAutoName) {
+        // 1. Если новое название УЖЕ есть — ничего не делаем
+        if (mb_stripos($partName, $newAutoName) !== false) {
             return $partName;
         }
 
-        // Ищем старое название авто в названии запчасти
-        $pattern = '/(.*?)(' . preg_quote($oldAutoName, '/') . ')(.*)/u';
-        
-        if (preg_match($pattern, $partName, $matches)) {
-            // Сохраняем префикс (например, "Гайка Audi ") и суффикс
-            $prefix = $matches[1];
-            $suffix = $matches[3];
-            
-            // Формируем новое название
-            return $prefix . $newAutoName . $suffix;
+        // 2. Если есть старое — заменяем
+        if ($oldAutoName && mb_stripos($partName, $oldAutoName) !== false) {
+            return preg_replace(
+                '/' . preg_quote($oldAutoName, '/') . '/u',
+                $newAutoName,
+                $partName,
+                1 // ТОЛЬКО ПЕРВОЕ ВХОЖДЕНИЕ
+            );
         }
-        
-        return $partName . ' ' . $newAutoName;
+
+        // 3. Если нет ни старого, ни нового — НИЧЕГО НЕ ДЕЛАЕМ
+        // (или можешь добавить вручную, если решишь)
+        return $partName;
+    }
+
+
+    private static function log($message, $context = [])
+    {
+        $line = date('Y-m-d H:i:s') . ' | ' . $message;
+
+        if (!empty($context)) {
+            $line .= ' | ' . json_encode($context, JSON_UNESCAPED_UNICODE);
+        }
+
+        $line .= PHP_EOL;
+
+        file_put_contents(
+            $_SERVER['DOCUMENT_ROOT'] . self::$logFile,
+            $line,
+            FILE_APPEND
+        );
     }
 }
